@@ -148,7 +148,20 @@ function formatCustomerSummary(name, phone, morning, evening) {
   msg += `\n━━━━━━━━━━━━━━\nTotal per day: ${total}L`
   return msg
 }
+ 
+ // Middlewares
 
+const ALLOWED_USER = process.env.ALLOWED_USER
+
+bot.use((ctx, next) => {
+  const userId = ctx.from?.id?.toString()
+
+  if (userId !== ALLOWED_USER) {
+    return ctx.reply("🚫 This bot is private")
+  }
+
+  return next()
+})
 
 // ---------- COMMANDS ----------
 
