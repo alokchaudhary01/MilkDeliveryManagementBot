@@ -2,6 +2,7 @@ import { Telegraf } from "telegraf"
 import Customer from "./models/user.model.js"
 import MilkHistory from "./models/milkhistory.model.js"
 import { getLatestValidRecords } from "./utils/getLatestValid.js"
+import {Markup } from "telegraf"
 import dotenv from "dotenv"
 dotenv.config()
 
@@ -231,6 +232,143 @@ bot.command("summary", async (ctx) => {
   msg += `\n━━━━━━━━━━━━━━\nTotal Morning: ${totalMorning}L\nTotal Evening: ${totalEvening}L`
 
   ctx.reply(msg)
+})
+
+bot.command("customers", async (ctx) => {
+  try {
+    const customers = await Customer.find()
+
+    const latest = await getLatestValidRecords()
+
+    // map for quick lookup
+    const latestMap = {}
+    latest.forEach(l => {
+      latestMap[l._id.toString()] = l
+    })
+
+    let msg = "👥 Customers List\n\n"
+
+    customers.forEach((c, i) => {
+      const data = latestMap[c._id.toString()]
+
+      let total = 0
+
+      if (data) {
+        for (let size in data.morning) {
+          total += size * data.morning[size]
+        }
+        for (let size in data.evening) {
+          total += size * data.evening[size]
+        }
+      }
+
+      msg += `${i + 1}. ${c.name} (${c.phone}) → ${total}L\n`
+    })
+
+    ctx.reply(msg)
+
+  } catch {
+    ctx.reply("Error ❌")
+  }
+})
+
+bot.command("customer", async (ctx) => {
+  try {
+    const phone = ctx.message.text.split(" ")[1]
+    if (!phone) return ctx.reply("Usage: /customer phone")
+
+    const customer = await Customer.findOne({ phone })
+    if (!customer) return ctx.reply("Customer not found ❌")
+
+    // 📅 Full history (latest first)
+    const history = await MilkHistory.find({
+      customerId: customer._id
+    }).sort({ startDate: -1 })
+
+    let msg = `👤 ${customer.name} (${customer.phone})\n\n`
+
+    // 📅 History
+    msg += "📅 History:\n"
+
+    history.forEach(h => {
+      let total = 0
+
+      for (let size in h.morning) {
+        total += size * h.morning[size]
+      }
+      for (let size in h.evening) {
+        total += size * h.evening[size]
+      }
+
+      msg += `${h.displayDate} → ${total}L\n`
+    })
+
+    // 📊 Current (latest valid)
+    const latest = await getLatestValidRecords()
+    const current = latest.find(l => 
+      l._id.toString() === customer._id.toString()
+    )
+
+    if (current) {
+      let m = 0, e = 0
+
+      for (let size in current.morning) {
+        m += size * current.morning[size]
+      }
+      for (let size in current.evening) {
+        e += size * current.evening[size]
+      }
+
+      msg += `\n📊 Current:\nMorning: ${m}L\nEvening: ${e}L\nTotal: ${m + e}L`
+    }
+
+    ctx.reply(msg)
+
+  } catch {
+    ctx.reply("Error ❌")
+  }
+})
+
+bot.command("delete", async (ctx) => {
+  const phone = ctx.message.text.split(" ")[1]
+
+  if (!phone) return ctx.reply("Usage: /delete phone")
+
+  const customer = await Customer.findOne({ phone })
+  if (!customer) return ctx.reply("Customer not found ❌")
+
+  ctx.reply(
+    `⚠️ Are you sure you want to delete ${customer.name}?`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("✅ Yes Delete", `confirm_delete_${phone}`),
+        Markup.button.callback("❌ Cancel", `cancel_delete_${phone}`)
+      ]
+    ])
+  )
+})
+
+bot.action(/confirm_delete_(.+)/, async (ctx) => {
+  try {
+    const phone = ctx.match[1]
+
+    const customer = await Customer.findOne({ phone })
+    if (!customer) {
+      return ctx.answerCbQuery("Customer not found ❌")
+    }
+
+    await MilkHistory.deleteMany({ customerId: customer._id })
+    await Customer.deleteOne({ _id: customer._id })
+
+    await ctx.editMessageText(`✅ Deleted: ${customer.name} (${phone})`)
+
+  } catch {
+    ctx.answerCbQuery("Error ❌")
+  }
+})
+
+bot.action(/cancel_delete_(.+)/, async (ctx) => {
+  await ctx.editMessageText("❌ Delete cancelled")
 })
 
 export default bot
