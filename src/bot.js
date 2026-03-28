@@ -1,15 +1,16 @@
-import { Telegraf } from "telegraf"
+import { Telegraf, Markup } from "telegraf"
 import Customer from "./models/user.model.js"
 import MilkHistory from "./models/milkhistory.model.js"
-import { getLatestValidRecords } from "./utils/getLatestValid.js"
-import {Markup } from "telegraf"
 import dotenv from "dotenv"
+
 dotenv.config()
 
 const bot = new Telegraf(process.env.BOT_TOKEN)
 
 
 // ---------- HELPERS ----------
+
+// ✅ Date parser (UTC + display)
 function parseDate(input = "0") {
   const now = new Date()
 
@@ -26,15 +27,14 @@ function parseDate(input = "0") {
     date = d.getDate()
   }
 
-  // ✅ UTC date for DB
   const startDate = new Date(Date.UTC(year, month, date))
 
-  // ✅ display string
   const displayDate = `${String(date).padStart(2, "0")}-${String(month + 1).padStart(2, "0")}-${year}`
 
   return { startDate, displayDate }
 }
 
+// ✅ Calculate litres
 function calculateLitres(packets) {
   let total = 0
   for (let size in packets) {
@@ -43,6 +43,7 @@ function calculateLitres(packets) {
   return total
 }
 
+// ✅ Parse shorthand input (52m etc)
 function parseInput(tokens) {
   const morning = { "0.25": 0, "0.5": 0, "0.75": 0, "1": 0 }
   const evening = { "0.25": 0, "0.5": 0, "0.75": 0, "1": 0 }
@@ -66,18 +67,61 @@ function parseInput(tokens) {
       size = 1
       count = Number(value.slice(1))
     } else {
-      throw new Error("Invalid token")
+      throw new Error(`Invalid token: ${token}`)
     }
 
-    if (!count || count <= 0) return
+    if (!count || isNaN(count) || count <= 0) {
+      throw new Error(`Invalid token: ${token}`)
+    }
 
     if (time === "m") morning[size] += count
     else if (time === "e") evening[size] += count
+    else throw new Error(`Invalid token: ${token}`)
   })
 
   return { morning, evening }
 }
 
+// ✅ Latest valid records (ignore future)
+async function getLatestValidRecords() {
+  const now = new Date()
+
+  const todayEnd = new Date(Date.UTC(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    23, 59, 59, 999
+  ))
+
+  return await MilkHistory.aggregate([
+    { $match: { startDate: { $lte: todayEnd } } },
+    { $sort: { startDate: -1 } },
+    {
+      $group: {
+        _id: "$customerId",
+        morning: { $first: "$morning" },
+        evening: { $first: "$evening" }
+      }
+    }
+  ])
+}
+
+// ✅ Overall summary
+async function getOverallSummary() {
+  const latest = await getLatestValidRecords()
+
+  let totalMorning = 0
+  let totalEvening = 0
+
+  latest.forEach(c => {
+    totalMorning += calculateLitres(c.morning)
+    totalEvening += calculateLitres(c.evening)
+  })
+
+  return { totalMorning, totalEvening }
+}
+
+// ✅ Format customer summary
 function formatCustomerSummary(name, phone, morning, evening) {
   let msg = `✅ Milk Updated\n\n👤 ${name} (${phone})\n\n`
 
@@ -86,7 +130,7 @@ function formatCustomerSummary(name, phone, morning, evening) {
   msg += "Morning:\n"
   for (let size in morning) {
     if (morning[size] > 0) {
-      const val = size * morning[size]
+      const val = Number(size) * morning[size]
       total += val
       msg += `${size}L × ${morning[size]} = ${val}L\n`
     }
@@ -95,7 +139,7 @@ function formatCustomerSummary(name, phone, morning, evening) {
   msg += "\nEvening:\n"
   for (let size in evening) {
     if (evening[size] > 0) {
-      const val = size * evening[size]
+      const val = Number(size) * evening[size]
       total += val
       msg += `${size}L × ${evening[size]} = ${val}L\n`
     }
@@ -106,29 +150,11 @@ function formatCustomerSummary(name, phone, morning, evening) {
 }
 
 
-// ---------- OVERALL SUMMARY ----------
-async function getOverallSummary() {
-  const latest = await getLatestValidRecords()
-
-  let totalMorning = 0
-  let totalEvening = 0
-
-  latest.forEach(c => {
-    for (let size in c.morning) {
-      totalMorning += Number(size) * c.morning[size]
-    }
-    for (let size in c.evening) {
-      totalEvening += Number(size) * c.evening[size]
-    }
-  })
-
-  return { totalMorning, totalEvening }
-}
-
-
 // ---------- COMMANDS ----------
+
 bot.start(ctx => ctx.reply("Milk Bot Ready 🥛"))
 
+// ➕ ADD
 bot.command("add", async (ctx) => {
   const [name, phone] = ctx.message.text.split(" ").slice(1)
 
@@ -142,6 +168,7 @@ bot.command("add", async (ctx) => {
 })
 
 
+// 🔄 SET
 bot.command("set", async (ctx) => {
   try {
     const parts = ctx.message.text.split(" ").slice(1)
@@ -159,18 +186,19 @@ bot.command("set", async (ctx) => {
 
     const { startDate, displayDate } = parseDate(dateInput)
 
-await MilkHistory.deleteOne({
-  customerId: customer._id,
-  startDate
-})
+    await MilkHistory.deleteOne({
+      customerId: customer._id,
+      startDate
+    })
 
-await MilkHistory.create({
-  customerId: customer._id,
-  startDate,
-  displayDate, // ✅ add this
-  morning,
-  evening
-})
+    await MilkHistory.create({
+      customerId: customer._id,
+      startDate,
+      displayDate,
+      morning,
+      evening
+    })
+
     const summaryMsg = formatCustomerSummary(
       customer.name,
       phone,
@@ -180,20 +208,24 @@ await MilkHistory.create({
 
     const overall = await getOverallSummary()
 
-  ctx.reply(
-  summaryMsg +
-  `\n\n📊 Updated Delivery:\nMorning: ${overall.totalMorning}L\nEvening: ${overall.totalEvening}L`
-)
+    ctx.reply(
+      summaryMsg +
+      `\n\n📊 Updated Delivery:\nMorning: ${overall.totalMorning}L\nEvening: ${overall.totalEvening}L`
+    )
 
-  } catch {
-    ctx.reply("❌ Invalid format\nExample: /set 98765 52m 252e 0")
+  } catch (err) {
+    ctx.reply(`❌ Invalid format\nExample: /set 98765 52m 252e 0`)
   }
 })
 
 
-
+// 📊 SUMMARY
 bot.command("summary", async (ctx) => {
   const latest = await getLatestValidRecords()
+
+  if (latest.length === 0) {
+    return ctx.reply("No milk data found ❌")
+  }
 
   const morningPackets = { "0.25": 0, "0.5": 0, "0.75": 0, "1": 0 }
   const eveningPackets = { "0.25": 0, "0.5": 0, "0.75": 0, "1": 0 }
@@ -205,7 +237,6 @@ bot.command("summary", async (ctx) => {
     for (let size in c.morning) {
       morningPackets[size] += c.morning[size] || 0
     }
-
     for (let size in c.evening) {
       eveningPackets[size] += c.evening[size] || 0
     }
@@ -216,7 +247,7 @@ bot.command("summary", async (ctx) => {
   for (let size in morningPackets) {
     if (morningPackets[size] > 0) {
       msg += `${size}L → ${morningPackets[size]} pkt\n`
-      totalMorning += size * morningPackets[size]
+      totalMorning += Number(size) * morningPackets[size]
     }
   }
 
@@ -225,7 +256,7 @@ bot.command("summary", async (ctx) => {
   for (let size in eveningPackets) {
     if (eveningPackets[size] > 0) {
       msg += `${size}L → ${eveningPackets[size]} pkt\n`
-      totalEvening += size * eveningPackets[size]
+      totalEvening += Number(size) * eveningPackets[size]
     }
   }
 
@@ -234,111 +265,74 @@ bot.command("summary", async (ctx) => {
   ctx.reply(msg)
 })
 
+
+// 👥 CUSTOMERS LIST
 bot.command("customers", async (ctx) => {
-  try {
-    const customers = await Customer.find()
+  const customers = await Customer.find()
+  const latest = await getLatestValidRecords()
 
-    const latest = await getLatestValidRecords()
+  const latestMap = {}
+  latest.forEach(l => {
+    latestMap[l._id.toString()] = l
+  })
 
-    // map for quick lookup
-    const latestMap = {}
-    latest.forEach(l => {
-      latestMap[l._id.toString()] = l
-    })
+  let msg = "👥 Customers List\n\n"
 
-    let msg = "👥 Customers List\n\n"
+  customers.forEach((c, i) => {
+    const data = latestMap[c._id.toString()]
+    let total = 0
 
-    customers.forEach((c, i) => {
-      const data = latestMap[c._id.toString()]
-
-      let total = 0
-
-      if (data) {
-        for (let size in data.morning) {
-          total += size * data.morning[size]
-        }
-        for (let size in data.evening) {
-          total += size * data.evening[size]
-        }
-      }
-
-      msg += `${i + 1}. ${c.name} (${c.phone}) → ${total}L\n`
-    })
-
-    ctx.reply(msg)
-
-  } catch {
-    ctx.reply("Error ❌")
-  }
-})
-
-bot.command("customer", async (ctx) => {
-  try {
-    const phone = ctx.message.text.split(" ")[1]
-    if (!phone) return ctx.reply("Usage: /customer phone")
-
-    const customer = await Customer.findOne({ phone })
-    if (!customer) return ctx.reply("Customer not found ❌")
-
-    // 📅 Full history (latest first)
-    const history = await MilkHistory.find({
-      customerId: customer._id
-    }).sort({ startDate: -1 })
-
-    let msg = `👤 ${customer.name} (${customer.phone})\n\n`
-
-    // 📅 History
-    msg += "📅 History:\n"
-
-    history.forEach(h => {
-      let total = 0
-
-      for (let size in h.morning) {
-        total += size * h.morning[size]
-      }
-      for (let size in h.evening) {
-        total += size * h.evening[size]
-      }
-
-      msg += `${h.displayDate} → ${total}L\n`
-    })
-
-    // 📊 Current (latest valid)
-    const latest = await getLatestValidRecords()
-    const current = latest.find(l => 
-      l._id.toString() === customer._id.toString()
-    )
-
-    if (current) {
-      let m = 0, e = 0
-
-      for (let size in current.morning) {
-        m += size * current.morning[size]
-      }
-      for (let size in current.evening) {
-        e += size * current.evening[size]
-      }
-
-      msg += `\n📊 Current:\nMorning: ${m}L\nEvening: ${e}L\nTotal: ${m + e}L`
+    if (data) {
+      total = calculateLitres(data.morning) + calculateLitres(data.evening)
     }
 
-    ctx.reply(msg)
+    msg += `${i + 1}. ${c.name} (${c.phone}) → ${total}L\n`
+  })
 
-  } catch {
-    ctx.reply("Error ❌")
-  }
+  ctx.reply(msg)
 })
 
-bot.command("delete", async (ctx) => {
+
+// 👤 CUSTOMER DETAIL
+bot.command("customer", async (ctx) => {
   const phone = ctx.message.text.split(" ")[1]
 
-  if (!phone) return ctx.reply("Usage: /delete phone")
+  const customer = await Customer.findOne({ phone })
+  if (!customer) return ctx.reply("Customer not found ❌")
+
+  const history = await MilkHistory.find({ customerId: customer._id })
+    .sort({ startDate: -1 })
+
+  let msg = `👤 ${customer.name} (${customer.phone})\n\n📅 History:\n`
+
+  history.forEach(h => {
+    const total = calculateLitres(h.morning) + calculateLitres(h.evening)
+    msg += `${h.displayDate} → ${total}L\n`
+  })
+
+  const latest = await getLatestValidRecords()
+  const current = latest.find(l => l._id.toString() === customer._id.toString())
+
+  if (current) {
+    const m = calculateLitres(current.morning)
+    const e = calculateLitres(current.evening)
+
+    msg += `\n📊 Current:\nMorning: ${m}L\nEvening: ${e}L\nTotal: ${m + e}L`
+  }
+
+  ctx.reply(msg)
+})
+
+
+// 🗑️ DELETE (WITH BUTTON)
+bot.command("delete", async (ctx) => {
+  const phone = ctx.message.text.split(" ")[1]
 
   const customer = await Customer.findOne({ phone })
   if (!customer) return ctx.reply("Customer not found ❌")
 
   ctx.reply(
-    `⚠️ Are you sure you want to delete ${customer.name}?`,
+    `⚠️ Delete ${customer.name} (${customer.phone})?\nThis will remove ALL history.`,
     Markup.inlineKeyboard([
       [
         Markup.button.callback("✅ Yes Delete", `confirm_delete_${phone}`),
@@ -350,12 +344,12 @@ bot.command("delete", async (ctx) => {
 
 bot.action(/confirm_delete_(.+)/, async (ctx) => {
   try {
-    const phone = ctx.match[1]
+    await ctx.answerCbQuery()
 
+    const phone = ctx.match[1]
     const customer = await Customer.findOne({ phone })
-    if (!customer) {
-      return ctx.answerCbQuery("Customer not found ❌")
-    }
+
+    if (!customer) return ctx.answerCbQuery("Not found ❌")
 
     await MilkHistory.deleteMany({ customerId: customer._id })
     await Customer.deleteOne({ _id: customer._id })
@@ -368,7 +362,83 @@ bot.action(/confirm_delete_(.+)/, async (ctx) => {
 })
 
 bot.action(/cancel_delete_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery()
   await ctx.editMessageText("❌ Delete cancelled")
 })
+
+bot.command("tomorrow", async (ctx) => {
+  try {
+    const now = new Date()
+
+    // ✅ Tomorrow end (UTC safe)
+    const tomorrowEnd = new Date(Date.UTC(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+      23, 59, 59, 999
+    ))
+
+    const latest = await MilkHistory.aggregate([
+      {
+        $match: {
+          startDate: { $lte: tomorrowEnd } // 👈 tomorrow tak ka data
+        }
+      },
+      { $sort: { startDate: -1 } },
+      {
+        $group: {
+          _id: "$customerId",
+          morning: { $first: "$morning" },
+          evening: { $first: "$evening" }
+        }
+      }
+    ])
+
+    if (latest.length === 0) {
+      return ctx.reply("No data for tomorrow ❌")
+    }
+
+    const morningPackets = { "0.25": 0, "0.5": 0, "0.75": 0, "1": 0 }
+    const eveningPackets = { "0.25": 0, "0.5": 0, "0.75": 0, "1": 0 }
+
+    let totalMorning = 0
+    let totalEvening = 0
+
+    latest.forEach(c => {
+      for (let size in c.morning) {
+        morningPackets[size] += c.morning[size] || 0
+      }
+      for (let size in c.evening) {
+        eveningPackets[size] += c.evening[size] || 0
+      }
+    })
+
+    let msg = "📅 Tomorrow Delivery\n\nMorning:\n"
+
+    for (let size in morningPackets) {
+      if (morningPackets[size] > 0) {
+        msg += `${size}L → ${morningPackets[size]} pkt\n`
+        totalMorning += Number(size) * morningPackets[size]
+      }
+    }
+
+    msg += "\nEvening:\n"
+
+    for (let size in eveningPackets) {
+      if (eveningPackets[size] > 0) {
+        msg += `${size}L → ${eveningPackets[size]} pkt\n`
+        totalEvening += Number(size) * eveningPackets[size]
+      }
+    }
+
+    msg += `\n━━━━━━━━━━━━━━\nTotal Morning: ${totalMorning}L\nTotal Evening: ${totalEvening}L`
+
+    ctx.reply(msg)
+
+  } catch {
+    ctx.reply("Error ❌")
+  }
+})
+
 
 export default bot
